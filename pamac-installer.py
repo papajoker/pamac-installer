@@ -11,6 +11,85 @@ from PyQt5.QtWidgets import (QAction, QApplication, QMainWindow, QMessageBox, QT
 import sys
 import re
 
+class Commit:
+
+    def __init__(self, db, post_message):
+        self.data = None
+        self.loop = None
+
+        #self.statusBar = statusBar
+        #self.text = text
+        self.post_message = post_message
+
+        self.transaction = self.transaction = Pamac.Transaction(database=db)
+
+        self.transaction.connect("emit-action", self.on_emit_action, self.data)
+        self.transaction.connect("emit-action-progress", self.on_emit_action_progress, self.data)
+        self.transaction.connect("emit-hook-progress", self.on_emit_hook_progress, self.data)
+        self.transaction.connect("emit-error", self.on_emit_error, self.data)
+        self.transaction.connect("emit-warning", self.on_emit_warning, self.data)
+        self.transaction.connect("finished", self.on_trans_finished, self.data)
+
+    def __enter__(self):
+        if not self.transaction.get_lock():
+            raise Exception("pamac-system-daemon running")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.loop = GLib.MainLoop()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        try:
+            self.loop.quit()
+            self.transaction.unlock()
+            self.transaction.quit_daemon()
+        except:
+            pass
+        QApplication.restoreOverrideCursor()
+
+    def run(self, to_install=[], to_remove=[], to_load=[]):
+        if self.transaction.get_lock():
+            self.transaction.start(to_install, to_remove, to_load, [], [], [])
+            # launch a loop to wait for finished signal to be emitted
+            self.loop.run()
+
+    def on_trans_finished(self, transaction, success, data):
+        print(success)
+        self.post_message('END.', 6)
+        self.loop.quit()
+
+    def on_emit_error(self, transaction, message, details, details_length, data):
+        #print("------")
+        if details_length > 0:
+            print(f"{message}:")
+            for detail in details:
+                print(detail)
+                self.post_message(detail, 4)
+        else:
+            self.post_message(message, 4)
+            print(message)
+        self.loop.quit()
+        transaction.unlock()
+        transaction.quit_daemon()
+
+    def on_emit_action(self, transaction, action, data):
+        print("on_emit_action", action)
+        self.post_message(action, 1)
+
+    def on_emit_hook_progress(self, transaction, action, details, status, progress, data):
+        #print(f"{action} {details} {status}")
+        self.post_message(f"{action} {details} {status}", 3)
+
+
+    def on_emit_action_progress(self, transaction, action, status, progress, data):
+        print("on_emit_action_progress", f"{action} {status}")
+        if not status.startswith("0"):
+            self.post_message(f"::{action} {status}", 3)
+
+    def on_emit_warning(self, transaction, message, data):
+        print("on_emit_warning", message)
+        self.post_message(message, 5)
+
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -36,16 +115,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         event.accept()
-        self.transaction.unlock()
-        self.transaction.quit_daemon()
         self.writeSettings()
 
     def setPacman(self):
-        self.loop = GLib.MainLoop()
         self.config = Pamac.Config(conf_path="/etc/pamac.conf")
         self.db = Pamac.Database(config=self.config)
-        self.transaction = Pamac.Transaction(database=self.db)
-        self.data = None
 
     def post_message(self, msg: str, status):
         switcher = {
@@ -54,6 +128,7 @@ class MainWindow(QMainWindow):
             3: "   ",
             4: "!!! ",
             5: "! ",
+            6: "",
         }   
         self.text.append(f"{switcher.get(status, '')}{msg}")
         self.statusBar().showMessage(msg, 2000)
@@ -63,68 +138,15 @@ class MainWindow(QMainWindow):
 
     def commit(self):
         """pacman commit"""
-
-        self.oldMsg = ""
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-
-        def on_trans_finished (transaction, success, data):
-            transaction.unlock()
-            transaction.quit_daemon()
-            self.loop.quit()
-            print(success)
-            self.statusBar().showMessage("End.", 12000)
-            QApplication.restoreOverrideCursor()
-            #self.text.setReadOnly(False)
-
-        def on_emit_error (transaction, message, details, details_length, data):
-            self.text.append("------")
-            if details_length > 0:
-                print(f"{message}:")
-                for detail in details:
-                    print(detail)
-                    self.post_message(detail, 4)
-            else:
-                self.post_message(message, 4)
-                print(message)
-
-        def on_emit_action (transaction, action, data):
-            print("on_emit_action", action)
-            self.post_message(action, 1)
-
-        def on_emit_hook_progress (transaction, action, details, status, progress, data):
-            #print(f"{action} {details} {status}")
-            self.post_message(f"{action} {details} {status}", 3)
-
-
-        def on_emit_action_progress (transaction, action, status, progress, data):
-            print("on_emit_action_progress", f"{action} {status}")
-            if not status.startswith("0"):
-                self.post_message(f"::{action} {status}", 3)
-
-        def on_emit_warning (transaction, message, data):
-            print("on_emit_warning", message)
-            self.post_message(message, 5)
-
-        self.transaction.connect("emit-action", on_emit_action, self.data)
-        self.transaction.connect("emit-action-progress", on_emit_action_progress, self.data)
-        self.transaction.connect("emit-hook-progress", on_emit_hook_progress, self.data)
-        self.transaction.connect("emit-error", on_emit_error, self.data)
-        self.transaction.connect("emit-warning", on_emit_warning, self.data)
-        self.transaction.connect("finished", on_trans_finished, self.data)
-
         self.parse_edit()
-        to_build = []
-        temporary_ignorepkgs = []
-        overwrite_files = []
         self.text.setReadOnly(True)
-        if self.transaction.get_lock():
-            self.transaction.start(self.to_install, self.to_remove, self.to_load, to_build, temporary_ignorepkgs, overwrite_files)
-            # launch a loop to wait for finished signal to be emitted
-            self.loop.run()
-        else:
-            print("self.transaction.get_lock():", self.transaction.get_lock(), "\nwait pamac-system-daemon end")
-            QMessageBox.critical(self, "pamac", "ERROR: pamac-system-daemon running")
-
+        try:
+            with Commit(self.db, self.post_message) as mycommit:
+                mycommit.run(to_install=self.to_install, to_remove=self.to_remove, to_load=self.to_load  )
+        except Exception as ex:
+            print("transaction.get_lock(): False", "\nwait "+ex.args[0])
+            QMessageBox.critical(self, "pamac", "ERROR: "+ex.args[0])
+        self.text.setReadOnly(False)
 
     def about(self):
         QMessageBox.about(self, "About Application",
@@ -198,6 +220,7 @@ class MainWindow(QMainWindow):
         pkgs = self.text.toPlainText()
         # remove descriptions
         pkgs = re.sub(r"\(.*\)", "", pkgs)
+        #TODO remove text after "--> Preparing..." if reload
         pkgs = pkgs.split()
         for pkg in pkgs:
             if pkg.startswith("-"):
